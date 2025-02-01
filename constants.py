@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 DEFAULT_CONFIG = "config.json"
 DRY_RUN_WALLET = 10000
+CUSTOM_TAG_MAX_LENGTH = 255
 
 MINIMAL_CONFIG = {
     "dry_run": True,

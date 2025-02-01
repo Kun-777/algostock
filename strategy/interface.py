@@ -1,13 +1,15 @@
 import logging
 from abc import ABC, abstractmethod
-from constants import IntOrInf, Config
+from constants import IntOrInf, Config, CUSTOM_TAG_MAX_LENGTH
 from datetime import datetime, timedelta, timezone
 from pandas import DataFrame
 
+from enums import SignalType, SignalTagType, SignalDirection, ExitType, ExitCheckTuple
 from exceptions import StrategyError
+from models import Trade, Order
 from strategy.strategy_wrapper import strategy_safe_wrapper
 from misc import remove_entry_exit_signals
-from util import dt_now, timeframe_to_minutes
+from util import dt_now, timeframe_to_minutes, timeframe_to_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -68,15 +70,6 @@ class IStrategy(ABC):
         """
         return dataframe
 
-    def populate_buy_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        """
-        DEPRECATED - please migrate to populate_entry_trend
-        :param dataframe: DataFrame
-        :param metadata: Additional information, like the currently traded symbol
-        :return: DataFrame with buy column
-        """
-        return dataframe
-
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """
         Based on TA indicators, populates the entry signal for the given dataframe
@@ -84,7 +77,7 @@ class IStrategy(ABC):
         :param metadata: Additional information, like the currently traded symbol
         :return: DataFrame with entry columns populated
         """
-        return self.populate_buy_trend(dataframe, metadata)
+        return dataframe
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """
@@ -93,7 +86,7 @@ class IStrategy(ABC):
         :param metadata: Additional information, like the currently traded symbol
         :return: DataFrame with exit columns populated
         """
-        return self.populate_sell_trend(dataframe, metadata)
+        return dataframe
 
     def bot_start(self, **kwargs) -> None:
         """
@@ -204,8 +197,6 @@ class IStrategy(ABC):
         Called right before placing a regular exit order.
         Timing for this function is critical, so avoid doing heavy computations or
         network requests in this method.
-
-        For full documentation please go to https://www.freqtrade.io/en/latest/strategy-advanced/
 
         When not implemented by a strategy, returns True (always confirming).
 
@@ -507,3 +498,348 @@ class IStrategy(ABC):
             )
             return None, None
         return latest, latest_date
+    
+    def get_exit_signal(
+        self, symbol: str, timeframe: str, dataframe: DataFrame, is_short: bool | None = None
+    ) -> tuple[bool, bool, str | None]:
+        """
+        Calculates current exit signal based based on the dataframe
+        columns of the dataframe.
+        Used by Bot to get the signal to exit.
+        depending on is_short, looks at "short" or "long" columns.
+        :param symbol: symbol to use
+        :param timeframe: timeframe to use
+        :param dataframe: Analyzed dataframe to get signal from.
+        :param is_short: Indicating existing trade direction.
+        :return: (enter, exit) A bool-tuple with enter / exit values.
+        """
+        latest, _latest_date = self.get_latest_candle(symbol, timeframe, dataframe)
+        if latest is None:
+            return False, False, None
+
+        if is_short:
+            enter = latest.get(SignalType.ENTER_SHORT.value, 0) == 1
+            exit_ = latest.get(SignalType.EXIT_SHORT.value, 0) == 1
+
+        else:
+            enter = latest.get(SignalType.ENTER_LONG.value, 0) == 1
+            exit_ = latest.get(SignalType.EXIT_LONG.value, 0) == 1
+        exit_tag = latest.get(SignalTagType.EXIT_TAG.value, None)
+        # Tags can be None, which does not resolve to False.
+        exit_tag = exit_tag if isinstance(exit_tag, str) and exit_tag != "nan" else None
+
+        logger.debug(f"exit-trigger: {latest['date']} (symbol={symbol}) enter={enter} exit={exit_}")
+
+        return enter, exit_, exit_tag
+    
+    def get_entry_signal(
+        self,
+        symbol: str,
+        timeframe: str,
+        dataframe: DataFrame,
+    ) -> tuple[SignalDirection | None, str | None]:
+        """
+        Calculates current entry signal based based on the dataframe signals
+        columns of the dataframe.
+        Used by Bot to get the signal to enter trades.
+        :param symbol: symbol to use
+        :param timeframe: timeframe to use
+        :param dataframe: Analyzed dataframe to get signal from.
+        :return: (SignalDirection, entry_tag)
+        """
+        latest, latest_date = self.get_latest_candle(symbol, timeframe, dataframe)
+        if latest is None or latest_date is None:
+            return None, None
+
+        enter_long = latest.get(SignalType.ENTER_LONG.value, 0) == 1
+        exit_long = latest.get(SignalType.EXIT_LONG.value, 0) == 1
+        enter_short = latest.get(SignalType.ENTER_SHORT.value, 0) == 1
+        exit_short = latest.get(SignalType.EXIT_SHORT.value, 0) == 1
+
+        enter_signal: SignalDirection | None = None
+        enter_tag: str | None = None
+        if enter_long == 1 and not any([exit_long, enter_short]):
+            enter_signal = SignalDirection.LONG
+            enter_tag = latest.get(SignalTagType.ENTER_TAG.value, None)
+        if (
+            self.can_short
+            and enter_short == 1
+            and not any([exit_short, enter_long])
+        ):
+            enter_signal = SignalDirection.SHORT
+            enter_tag = latest.get(SignalTagType.ENTER_TAG.value, None)
+
+        enter_tag = enter_tag if isinstance(enter_tag, str) and enter_tag != "nan" else None
+
+        timeframe_seconds = timeframe_to_seconds(timeframe)
+
+        if self.ignore_expired_candle(
+            latest_date=latest_date,
+            current_time=dt_now(),
+            timeframe_seconds=timeframe_seconds,
+            enter=bool(enter_signal),
+        ):
+            return None, enter_tag
+
+        logger.debug(
+            f"entry trigger: {latest['date']} (symbol={symbol}) "
+            f"enter={enter_long} enter_tag_value={enter_tag}"
+        )
+        return enter_signal, enter_tag
+    
+    def ignore_expired_candle(
+        self, latest_date: datetime, current_time: datetime, timeframe_seconds: int, enter: bool
+    ):
+        if self.ignore_buying_expired_candle_after and enter:
+            time_delta = current_time - (latest_date + timedelta(seconds=timeframe_seconds))
+            return time_delta.total_seconds() > self.ignore_buying_expired_candle_after
+        else:
+            return False
+        
+    def should_exit(
+        self,
+        trade: Trade,
+        rate: float,
+        current_time: datetime,
+        *,
+        enter: bool,
+        exit_: bool,
+        low: float | None = None,
+        high: float | None = None,
+        force_stoploss: float = 0,
+    ) -> list[ExitCheckTuple]:
+        """
+        This function evaluates if one of the conditions required to trigger an exit order
+        has been reached, which can either be a stop-loss, ROI or exit-signal.
+        :param low: Only used during backtesting to simulate (long)stoploss/(short)ROI
+        :param high: Only used during backtesting, to simulate (short)stoploss/(long)ROI
+        :param force_stoploss: Externally provided stoploss
+        :return: List of exit reasons - or empty list.
+        """
+        exits: list[ExitCheckTuple] = []
+        current_rate = rate
+        current_profit = trade.calc_profit_ratio(current_rate)
+        current_profit_best = current_profit
+        if low is not None or high is not None:
+            # Set current rate to high for backtesting ROI exits
+            current_rate_best = (low if trade.is_short else high) or rate
+            current_profit_best = trade.calc_profit_ratio(current_rate_best)
+
+        trade.adjust_min_max_rates(high or current_rate, low or current_rate)
+
+        stoplossflag = self.stoploss_reached(
+            current_rate=current_rate,
+            trade=trade,
+            current_time=current_time,
+            current_profit=current_profit,
+            force_stoploss=force_stoploss,
+            low=low,
+            high=high,
+        )
+
+        # if enter signal and ignore_roi is set, we don't need to evaluate min_roi.
+        roi_reached = not (enter and self.ignore_roi_if_entry_signal) and self.min_roi_reached(
+            trade=trade, current_profit=current_profit_best, current_time=current_time
+        )
+
+        exit_signal = ExitType.NONE
+        custom_reason = ""
+
+        if self.use_exit_signal:
+            if exit_ and not enter:
+                exit_signal = ExitType.EXIT_SIGNAL
+            else:
+                reason_cust = strategy_safe_wrapper(self.custom_exit, default_retval=False)(
+                    symbol=trade.symbol,
+                    trade=trade,
+                    current_time=current_time,
+                    current_rate=current_rate,
+                    current_profit=current_profit,
+                )
+                if reason_cust:
+                    exit_signal = ExitType.CUSTOM_EXIT
+                    if isinstance(reason_cust, str):
+                        custom_reason = reason_cust
+                        if len(reason_cust) > CUSTOM_TAG_MAX_LENGTH:
+                            logger.warning(
+                                f"Custom exit reason returned from "
+                                f"custom_exit is too long and was trimmed"
+                                f"to {CUSTOM_TAG_MAX_LENGTH} characters."
+                            )
+                            custom_reason = reason_cust[:CUSTOM_TAG_MAX_LENGTH]
+                    else:
+                        custom_reason = ""
+            if exit_signal == ExitType.CUSTOM_EXIT or (
+                exit_signal == ExitType.EXIT_SIGNAL
+                and (not self.exit_profit_only or current_profit > self.exit_profit_offset)
+            ):
+                logger.debug(
+                    f"{trade.symbol} - Sell signal received. "
+                    f"exit_type=ExitType.{exit_signal.name}"
+                    + (f", custom_reason={custom_reason}" if custom_reason else "")
+                )
+                exits.append(ExitCheckTuple(exit_type=exit_signal, exit_reason=custom_reason))
+
+        # Sequence:
+        # Exit-signal
+        # Stoploss
+        # ROI
+        # Trailing stoploss
+
+        if stoplossflag.exit_type in (ExitType.STOP_LOSS, ExitType.LIQUIDATION):
+            logger.debug(f"{trade.symbol} - Stoploss hit. exit_type={stoplossflag.exit_type}")
+            exits.append(stoplossflag)
+
+        if roi_reached:
+            logger.debug(f"{trade.symbol} - Required profit reached. exit_type=ExitType.ROI")
+            exits.append(ExitCheckTuple(exit_type=ExitType.ROI))
+
+        if stoplossflag.exit_type == ExitType.TRAILING_STOP_LOSS:
+            logger.debug(f"{trade.symbol} - Trailing stoploss hit.")
+            exits.append(stoplossflag)
+
+        return exits
+    
+    def stoploss_reached(
+        self,
+        current_rate: float,
+        trade: Trade,
+        current_time: datetime,
+        current_profit: float,
+        force_stoploss: float,
+        low: float | None = None,
+        high: float | None = None,
+    ) -> ExitCheckTuple:
+        """
+        Based on current profit of the trade and configured (trailing) stoploss,
+        decides to exit or not
+        :param current_profit: current profit as ratio
+        :param low: Low value of this candle, only set in backtesting
+        :param high: High value of this candle, only set in backtesting
+        """
+        # self.ft_stoploss_adjust(
+        #     current_rate, trade, current_time, current_profit, force_stoploss, low, high
+        # )
+
+        sl_higher_long = trade.stop_loss >= (low or current_rate) and not trade.is_short
+        sl_lower_short = trade.stop_loss <= (high or current_rate) and trade.is_short
+        liq_higher_long = (
+            trade.liquidation_price
+            and trade.liquidation_price >= (low or current_rate)
+            and not trade.is_short
+        )
+        liq_lower_short = (
+            trade.liquidation_price
+            and trade.liquidation_price <= (high or current_rate)
+            and trade.is_short
+        )
+
+        # evaluate if the stoploss was hit if stoploss is not on exchange
+        # in Dry-Run, this handles stoploss logic as well, as the logic will not be different to
+        # regular stoploss handling.
+        if (sl_higher_long or sl_lower_short) and (
+            not self.order_types.get("stoploss_on_exchange") or self.config["dry_run"]
+        ):
+            exit_type = ExitType.STOP_LOSS
+
+            # # If initial stoploss is not the same as current one then it is trailing.
+            # if trade.is_stop_loss_trailing:
+            #     exit_type = ExitType.TRAILING_STOP_LOSS
+            #     logger.debug(
+            #         f"{trade.symbol} - HIT STOP: current price at "
+            #         f"{((high if trade.is_short else low) or current_rate):.6f}, "
+            #         f"stoploss is {trade.stop_loss:.6f}, "
+            #         f"initial stoploss was at {trade.initial_stop_loss:.6f}, "
+            #         f"trade opened at {trade.open_rate:.6f}"
+            #     )
+
+            return ExitCheckTuple(exit_type=exit_type)
+
+        if liq_higher_long or liq_lower_short:
+            logger.debug(f"{trade.symbol} - Liquidation price hit. exit_type=ExitType.LIQUIDATION")
+            return ExitCheckTuple(exit_type=ExitType.LIQUIDATION)
+
+        return ExitCheckTuple(exit_type=ExitType.NONE)
+    
+    def min_roi_reached_entry(self, trade_dur: int) -> tuple[int | None, float | None]:
+        """
+        Based on trade duration defines the ROI entry that may have been reached.
+        :param trade_dur: trade duration in minutes
+        :return: minimal ROI entry value or None if none proper ROI entry was found.
+        """
+        # Get highest entry in ROI dict where key <= trade-duration
+        roi_list = [x for x in self.minimal_roi.keys() if x <= trade_dur]
+        if not roi_list:
+            return None, None
+        roi_entry = max(roi_list)
+        return roi_entry, self.minimal_roi[roi_entry]
+
+    def min_roi_reached(self, trade: Trade, current_profit: float, current_time: datetime) -> bool:
+        """
+        Based on trade duration, current profit of the trade and ROI configuration,
+        decides whether bot should exit.
+        :param current_profit: current profit as ratio
+        :return: True if bot should exit at current rate
+        """
+        # Check if time matches and current rate is above threshold
+        trade_dur = int((current_time.timestamp() - trade.open_date.timestamp()) // 60)
+        _, roi = self.min_roi_reached_entry(trade_dur)
+        if roi is None:
+            return False
+        else:
+            return current_profit > roi
+        
+    def advise_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        """
+        Populate indicators that will be used in the Buy, Sell, short, exit_short strategy
+        This method should not be overridden.
+        :param dataframe: Dataframe with data from the exchange
+        :param metadata: Additional information, like the currently traded symbol
+        :return: a Dataframe with all mandatory indicators for the strategies
+        """
+        logger.debug(f"Populating indicators for symbol {metadata.get('symbol')}.")
+
+        # call populate_indicators_Nm() which were tagged with @informative decorator.
+        # for inf_data, populate_fn in self._ft_informative:
+        #     dataframe = _create_and_merge_informative_symbol(
+        #         self, dataframe, metadata, inf_data, populate_fn
+        #     )
+
+        # self._if_enabled_populate_trades(dataframe, metadata)
+        return self.populate_indicators(dataframe, metadata)
+
+    def advise_entry(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        """
+        Based on TA indicators, populates the entry order signal for the given dataframe
+        This method should not be overridden.
+        :param dataframe: DataFrame
+        :param metadata: Additional information dictionary, with details like the
+            currently traded symbol
+        :return: DataFrame with buy column
+        """
+
+        logger.debug(f"Populating enter signals for symbol {metadata.get('symbol')}.")
+        # Initialize column to work around Pandas bug #56503.
+        dataframe.loc[:, "enter_tag"] = ""
+        df = self.populate_entry_trend(dataframe, metadata)
+        if "enter_long" not in df.columns:
+            df = df.rename({"buy": "enter_long", "buy_tag": "enter_tag"}, axis="columns")
+
+        return df
+
+    def advise_exit(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        """
+        Based on TA indicators, populates the exit order signal for the given dataframe
+        This method should not be overridden.
+        :param dataframe: DataFrame
+        :param metadata: Additional information dictionary, with details like the
+            currently traded symbol
+        :return: DataFrame with exit column
+        """
+        # Initialize column to work around Pandas bug #56503.
+        dataframe.loc[:, "exit_tag"] = ""
+        logger.debug(f"Populating exit signals for symbol {metadata.get('symbol')}.")
+        df = self.populate_exit_trend(dataframe, metadata)
+        if "exit_long" not in df.columns:
+            df = df.rename({"sell": "exit_long"}, axis="columns")
+        return df

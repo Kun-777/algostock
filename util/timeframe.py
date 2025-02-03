@@ -75,3 +75,19 @@ def timeframe_to_next_candle(timeframe: str, dt: datetime | None = None) -> date
     # Get offset based on timeframe in milliseconds
     offset = timestamp % ms
     return dt_from_ts(timestamp - offset + ms)
+
+def timeframe_to_prev_prev_candle(timeframe: str, dt: datetime | None = None) -> datetime:
+    """
+    Use Timeframe and determine the candle start time for this datetime.
+    Does not round when given a candle start time.
+    :param timeframe: timeframe in string format (e.g. "5m")
+    :param dt: datetime to use. Defaults to now(nyc timezone)
+    :returns: datetime of previous candle (with nyc timezone)
+    """
+    if not dt:
+        dt = dt_now()
+    ms = timeframe_to_msecs(timeframe)
+    timestamp = dt_ts(dt)
+    # Get offset based on timeframe in milliseconds
+    offset = timestamp % ms
+    return dt_from_ts(timestamp - offset - ms)

@@ -17,7 +17,12 @@ def remove_entry_exit_signals(dataframe: pd.DataFrame):
 
     return dataframe
 
-def parse_timeframe(timeframe):
+def parse_timeframe(timeframe: str):
+    """
+    parse timeframe to seconds
+
+    :param timeframe: Timeframe string (E.g. 5m, 4h)
+    """
     amount = int(timeframe[0:-1])
     unit = timeframe[-1]
     if 'y' == unit:

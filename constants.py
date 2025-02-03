@@ -27,6 +27,7 @@ CANCEL_REASON = {
     "USER_CANCEL": "user requested order cancel",
 }
 
+SymbolWithTimeframe = tuple[str, str]
 LongShort = Literal["long", "short"]
 EntryExit = Literal["entry", "exit"]
 BuySell = Literal["buy", "sell"]

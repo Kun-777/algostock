@@ -1,12 +1,13 @@
 import logging
 from abc import ABC, abstractmethod
-from constants import IntOrInf, Config, CUSTOM_TAG_MAX_LENGTH
-from datetime import datetime, timedelta, timezone
 from pandas import DataFrame
 
+from constants import IntOrInf, Config, CUSTOM_TAG_MAX_LENGTH
+from datetime import datetime, timedelta, timezone
 from enums import SignalType, SignalTagType, SignalDirection, ExitType, ExitCheckTuple
 from exceptions import StrategyError
 from models import Trade, Order
+from data.dataprovider import DataProvider
 from strategy.strategy_wrapper import strategy_safe_wrapper
 from misc import remove_entry_exit_signals
 from util import dt_now, timeframe_to_minutes, timeframe_to_seconds

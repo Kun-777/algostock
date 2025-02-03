@@ -10,7 +10,8 @@ from util.timeframe import (
     timeframe_to_resample_freq,
     timeframe_to_msecs,
     timeframe_to_next_candle,
-    timeframe_to_prev_candle
+    timeframe_to_prev_candle,
+    timeframe_to_prev_prev_candle
 )
 
 from util.precise import Precise
@@ -25,5 +26,6 @@ __all__ = [
     "timeframe_to_msecs",
     "timeframe_to_next_candle",
     "timeframe_to_prev_candle",
+    "timeframe_to_prev_prev_candle",
     "Precise"
 ]
